@@ -13,11 +13,13 @@ use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_stm32::bind_interrupts;
-use embassy_stm32::gpio::{AnyPin, Pin};
+use embassy_stm32::exti::{Channel as ExtiChannel, ExtiInput};
+use embassy_stm32::gpio::{AnyPin, Input, Level, Output, Pin, Pull, Speed};
 use embassy_stm32::peripherals::{USART1, USART2, USART3, DMA1_CH2, DMA1_CH4};
 use embassy_stm32::usart::{Config as UartConfig, InterruptHandler, UartRx, UartTx};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_time::Timer;
 use panic_probe as _;
 
 #[path = "../common.rs"]
@@ -26,13 +28,56 @@ use common::*;
 
 const CRSF_BAUDRATE: u32 = 420_000;
 
+static SWITCH_MODE: AtomicU8 = AtomicU8::new(SwitchMode::Independent as u8);
+
 static ACTIVE_RX: AtomicU8 = AtomicU8::new(0);
 
 static PACKETS_QUEUE: Channel<ThreadModeRawMutex, OwnedRawPacket, 4> = Channel::new();
 
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum SwitchMode {
+    Independent,
+    // We construct it from u8 value
+    #[allow(dead_code)]
+    Simultaneous,
+}
+
+impl SwitchMode {
+    fn next_mode(&self) -> Self {
+        Self::from(*self as u8 + 1)
+    }
+}
+
+impl From<u8> for SwitchMode {
+    fn from(source: u8) -> Self {
+        SwitchMode::try_from(source).unwrap_or(SwitchMode::Independent)
+    }
+}
+
 #[embassy_executor::task]
 async fn blink(led: AnyPin) {
-    common::blink(led).await
+    let mut led = Output::new(led, Level::High, Speed::Low);
+    led.set_low();
+
+    loop {
+        // Indicate current switch mode with long blinks
+        common::blink(&mut led, SWITCH_MODE.load(Ordering::Relaxed), 1000).await;
+
+        // Indicate current aux channel with short blinks
+        common::blink(&mut led, AUX_SWITCH, 200).await;
+        Timer::after_millis(2000).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn mode_switcher(mut switch_mode_input: ExtiInput<'static, AnyPin>) {
+    loop {
+        switch_mode_input.wait_for_rising_edge().await;
+        SWITCH_MODE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(SwitchMode::from(v).next_mode() as u8)
+        }).ok();
+    }
 }
 
 #[embassy_executor::task]
@@ -74,11 +119,22 @@ async fn read_input(
                             Ok(Packet { addr: _, payload: PacketPayload::RcChannels(channels) }) => {
                                 let switch_val = channels[SWITCH_CHANNEL_IX];
                                 let cur_switch_state = if switch_val > TRIGGER_VAL { 1 } else { 0 };
-                                if prev_switch_state < 0 {
-                                    prev_switch_state = cur_switch_state;
-                                } else if prev_switch_state != cur_switch_state {
-                                    ACTIVE_RX.store(input_num, Ordering::Relaxed);
-                                    prev_switch_state = cur_switch_state;
+
+                                match SWITCH_MODE.load(Ordering::Relaxed).into() {
+                                    SwitchMode::Independent => {
+                                        if prev_switch_state < 0 {
+                                            prev_switch_state = cur_switch_state;
+                                        } else if prev_switch_state != cur_switch_state {
+                                            ACTIVE_RX.store(input_num, Ordering::Relaxed);
+                                            prev_switch_state = cur_switch_state;
+                                        }
+                                    }
+                                    SwitchMode::Simultaneous => {
+                                        if cur_switch_state != prev_switch_state {
+                                            ACTIVE_RX.store(cur_switch_state as u8, Ordering::Relaxed);
+                                            prev_switch_state = cur_switch_state;
+                                        }
+                                    }
                                 }
                             }
                             Ok(_) => {}
@@ -132,6 +188,14 @@ async fn main(spawner: Spawner) {
         p.USART3, p.PB10, p.DMA1_CH5, uart_config
     ).unwrap();
 
+    let switch_mode_input = ExtiInput::new(
+        Input::new(p.PC13, Pull::Down).degrade(),
+        p.EXTI13.degrade()
+    );
+
+    spawner.spawn(
+        mode_switcher(switch_mode_input)
+    ).unwrap();
     spawner.spawn(
         blink(p.PC6.degrade())
     ).unwrap();

@@ -1,5 +1,5 @@
 use embassy_stm32::Config;
-use embassy_stm32::gpio::{AnyPin, Level, Output, Speed};
+use embassy_stm32::gpio::{AnyPin, Output};
 use embassy_stm32::peripherals::{DMA1_CH2, DMA1_CH4, DMA1_CH6, USART1, USART2, USART3};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{Error as UartError, UartRx};
@@ -77,19 +77,11 @@ pub(crate) fn mcu_config() -> Config {
     cfg
 }
 
-pub(crate) async fn blink(led: AnyPin) {
-    let mut led = Output::new(led, Level::High, Speed::Low);
-
-    led.set_low();
-    loop {
-        // Number of short blinks is equal to number of AUX
-        for _ in 0..AUX_SWITCH {
-            led.set_high();
-            Timer::after_millis(200).await;
-            led.set_low();
-            Timer::after_millis(200).await;
-        }
-
-        Timer::after_millis(2000).await;
+pub(crate) async fn blink(led: &mut Output<'static, AnyPin>, num: u8, delay_ms: u64) {
+    for _ in 0..num {
+        led.set_high();
+        Timer::after_millis(delay_ms).await;
+        led.set_low();
+        Timer::after_millis(delay_ms).await;
     }
 }

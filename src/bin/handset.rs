@@ -15,11 +15,12 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_stm32::bind_interrupts;
-use embassy_stm32::gpio::{AnyPin, Pin};
+use embassy_stm32::gpio::{AnyPin, Level, Output, Pin, Speed};
 use embassy_stm32::peripherals::{DMA1_CH2, DMA1_CH3, DMA1_CH4, DMA1_CH5, DMA1_CH6, USART1, USART2, USART3};
 use embassy_stm32::usart::{Config as UartConfig, InterruptHandler, Uart, UartRx, UartTx};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_time::Timer;
 use panic_probe as _;
 
 #[path = "../common.rs"]
@@ -35,7 +36,14 @@ static TX_TO_HANDSET_PACKETS_QUEUE: Channel<ThreadModeRawMutex, OwnedRawPacket, 
 
 #[embassy_executor::task]
 async fn blink(led: AnyPin) {
-    common::blink(led).await
+    let mut led = Output::new(led, Level::High, Speed::Low);
+    led.set_low();
+
+    loop {
+        // Indicate current aux channel with short blinks
+        common::blink(&mut led, AUX_SWITCH, 200).await;
+        Timer::after_millis(2000).await;
+    }
 }
 
 #[embassy_executor::task]
